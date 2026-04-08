@@ -142,13 +142,36 @@ def audio_pump_loop() -> None:
 
 
 def _broadcast(chunk: bytes) -> None:
+    """Send a chunk to every subscriber. Drop slow or dead ones.
+
+    Subscribers are non-blocking sockets (set in audio_socket_loop on
+    accept). A healthy subscriber drains the kernel send buffer fast
+    enough that send() returns the full byte count immediately. A slow
+    or dead subscriber raises BlockingIOError once its send buffer
+    fills, at which point we drop it — better to lose one slow client
+    than to freeze the whole fanout for the rest. This is the fix for
+    the bug where a `kill -9`'d subscriber whose buffer still held
+    bytes would block the entire pump loop indefinitely.
+    """
     dead: list[socket.socket] = []
     with audio_subscribers_lock:
         for sub in audio_subscribers:
             try:
-                sub.sendall(chunk)
+                sent = sub.send(chunk)
+            except BlockingIOError:
+                log.warning("audio: subscriber too slow (kernel buffer full), dropping")
+                dead.append(sub)
+                continue
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
                 log.info("audio: subscriber dead (%s)", e)
+                dead.append(sub)
+                continue
+            if sent < len(chunk):
+                # Partial write: buffer was almost full. Drop rather
+                # than retry — losing one slightly-truncated chunk is
+                # better than risking a deadlock or stale audio.
+                log.warning("audio: subscriber partial write (%d/%d), dropping",
+                            sent, len(chunk))
                 dead.append(sub)
         for sub in dead:
             audio_subscribers.remove(sub)
@@ -179,6 +202,13 @@ def audio_socket_loop() -> None:
                 continue
             except OSError:
                 break
+            # Non-blocking sends are critical: without this, a dead-but-
+            # still-ESTAB peer (e.g. one we kill -9'd while its kernel
+            # send buffer wasn't empty) would block sendall() forever
+            # and freeze the entire fanout. With non-blocking, sendall
+            # raises BlockingIOError instead and _broadcast drops the
+            # dead subscriber.
+            conn.setblocking(False)
             with audio_subscribers_lock:
                 audio_subscribers.append(conn)
                 stats["audio_subscribers"] = len(audio_subscribers)
