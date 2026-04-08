@@ -79,6 +79,13 @@ AUDIO_DEVICE_OVERRIDE = os.environ.get("HEIMDALL_AUDIO_DEVICE", "").strip()
 AUDIO_SOCKET_PATH = Path(
     os.environ.get("HEIMDALL_AUDIO_SOCKET", f"/run/heimdall/{LABEL}.sock")
 )
+
+# Where the captured snapshot lives on disk. POST /snapshot.png writes
+# here (atomically); GET /snapshot.png serves it. Single file per
+# instance — each new POST overwrites the previous snapshot.
+SNAPSHOT_PATH = Path(
+    os.environ.get("HEIMDALL_SNAPSHOT_PATH", f"/run/heimdall/{LABEL}-snapshot.png")
+)
 AUDIO_RATE = int(os.environ.get("HEIMDALL_AUDIO_RATE", "16000"))
 AUDIO_CHANNELS = int(os.environ.get("HEIMDALL_AUDIO_CHANNELS", "1"))
 VIDEO_ENABLED = os.environ.get("HEIMDALL_VIDEO_ENABLED", "0") == "1"
@@ -127,6 +134,7 @@ stats: dict = {
     "audio_socket": str(AUDIO_SOCKET_PATH),
     "video_enabled": VIDEO_ENABLED,
     "video_device": VIDEO_DEVICE if VIDEO_ENABLED else None,
+    "snapshot_path": str(SNAPSHOT_PATH),
     "http_endpoint": f"http://{HTTP_HOST}:{HTTP_PORT}",
     "started_at": None,
     "audio_bytes": 0,
@@ -135,6 +143,8 @@ stats: dict = {
     "frames_served": 0,
     "frame_errors": 0,
     "last_frame_at": None,
+    "snapshot_taken_at": None,
+    "snapshot_bytes": 0,
 }
 
 
@@ -486,25 +496,81 @@ class HeimdallHandler(http.server.BaseHTTPRequestHandler):
             body = json.dumps(stats, default=str, indent=2).encode() + b"\n"
             return self._send(200, body, "application/json")
         if self.path == "/frame.png":
-            if not VIDEO_ENABLED:
-                return self.send_error(404, "video not enabled on this instance")
-            # If the v4l2 device file is missing, the Elgato is unplugged.
-            # Skip the ffmpeg spawn (which would fail with rc!=0 in ~50ms
-            # anyway) and serve the cached frame if we have a recent one,
-            # otherwise return 503 so the client knows it's a transient
-            # device-gone state, not a code bug.
-            if not video_device_present():
-                if _cached_frame_bytes:
-                    age = time.monotonic() - _cached_frame_at
-                    log.info("video: device %s missing, serving cached frame (%.0fms old)",
-                             VIDEO_DEVICE, age * 1000)
-                    return self._send(200, _cached_frame_bytes, "image/png")
-                return self.send_error(503, f"video device {VIDEO_DEVICE} not available")
-            png = grab_frame()
-            if png is None:
-                return self.send_error(500, "frame grab failed")
-            return self._send(200, png, "image/png")
+            return self._handle_frame()
+        if self.path == "/snapshot.png":
+            return self._handle_snapshot_get()
         self.send_error(404, "not found")
+
+    def do_POST(self):  # noqa: N802
+        if self.path == "/snapshot.png":
+            return self._handle_snapshot_post()
+        self.send_error(404, "not found")
+
+    def _handle_frame(self) -> None:
+        """Live frame grab — fresh capture on every call (with 500ms cache)."""
+        if not VIDEO_ENABLED:
+            return self.send_error(404, "video not enabled on this instance")
+        # If the v4l2 device file is missing, the Elgato is unplugged.
+        # Skip the ffmpeg spawn (which would fail with rc!=0 in ~50ms
+        # anyway) and serve the cached frame if we have a recent one,
+        # otherwise return 503 so the client knows it's a transient
+        # device-gone state, not a code bug.
+        if not video_device_present():
+            if _cached_frame_bytes:
+                age = time.monotonic() - _cached_frame_at
+                log.info("video: device %s missing, serving cached frame (%.0fms old)",
+                         VIDEO_DEVICE, age * 1000)
+                return self._send(200, _cached_frame_bytes, "image/png")
+            return self.send_error(503, f"video device {VIDEO_DEVICE} not available")
+        png = grab_frame()
+        if png is None:
+            return self.send_error(500, "frame grab failed")
+        return self._send(200, png, "image/png")
+
+    def _handle_snapshot_get(self) -> None:
+        """Serve the most recently POST'd snapshot file."""
+        if not VIDEO_ENABLED:
+            return self.send_error(404, "video not enabled on this instance")
+        try:
+            data = SNAPSHOT_PATH.read_bytes()
+        except FileNotFoundError:
+            return self.send_error(
+                404, "no snapshot taken yet — POST /snapshot.png to capture one"
+            )
+        except OSError as e:
+            return self.send_error(500, f"snapshot read failed: {e}")
+        return self._send(200, data, "image/png")
+
+    def _handle_snapshot_post(self) -> None:
+        """Capture the current frame, save it to disk, return 200 JSON.
+
+        odin POSTs here on its first pedal press of the cycle. The
+        saved file is then served by GET /snapshot.png until the
+        next POST overwrites it. The atomic .tmp + rename means a
+        concurrent GET never sees a half-written file.
+        """
+        if not VIDEO_ENABLED:
+            return self.send_error(404, "video not enabled on this instance")
+        if not video_device_present():
+            return self.send_error(503, f"video device {VIDEO_DEVICE} not available")
+        png = grab_frame()
+        if png is None:
+            return self.send_error(500, "frame grab failed")
+        try:
+            SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = SNAPSHOT_PATH.with_suffix(".png.tmp")
+            tmp.write_bytes(png)
+            tmp.rename(SNAPSHOT_PATH)
+        except OSError as e:
+            log.error("snapshot: save failed: %s", e)
+            return self.send_error(500, f"snapshot save failed: {e}")
+        stats["snapshot_taken_at"] = time.time()
+        stats["snapshot_bytes"] = len(png)
+        log.info("snapshot: saved %d bytes to %s", len(png), SNAPSHOT_PATH)
+        body = json.dumps(
+            {"saved": str(SNAPSHOT_PATH), "bytes": len(png)}
+        ).encode() + b"\n"
+        return self._send(200, body, "application/json")
 
     def _send(self, code: int, body: bytes, ctype: str) -> None:
         self.send_response(code)
