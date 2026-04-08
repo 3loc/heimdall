@@ -19,6 +19,7 @@
           - ffmpeg         # capture pipeline backbone
           - v4l-utils      # /dev/video* introspection (v4l2-ctl)
           - alsa-utils     # arecord, audio device introspection
+          - openbsd-netcat # nc -U for ad-hoc Unix-socket debug from the shell
           # PipeWire stack — required because the Elgato exposes video and
           # audio as the same UVC USB device, and concurrent direct opens of
           # /dev/video0 + ALSA hw:0 starve the v4l2 endpoint at the kernel
@@ -105,3 +106,71 @@
       debug:
         msg: "/dev/video0 present: {{ video0_stat.stat.exists | default(false) }}"
       when: elgato_probe.rc == 0
+
+    # --- Install heimdall daemon, systemd template, and per-instance configs ---
+    - name: Install heimdall.py to /usr/local/bin/heimdall
+      copy:
+        src: ../src/heimdall.py
+        dest: /usr/local/bin/heimdall
+        owner: root
+        group: root
+        mode: '0755'
+      notify: restart heimdall meeting
+
+    - name: Install heimdall@.service systemd template unit
+      copy:
+        src: ../systemd/heimdall@.service
+        dest: /etc/systemd/system/heimdall@.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify:
+        - reload systemd
+        - restart heimdall meeting
+
+    - name: Ensure /etc/heimdall config directory exists
+      file:
+        path: /etc/heimdall
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install heimdall@meeting environment file
+      copy:
+        src: ../systemd/meeting.env
+        dest: /etc/heimdall/meeting.env
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart heimdall meeting
+
+    - name: Install heimdall@ted.env.example (placeholder, not active)
+      copy:
+        src: ../systemd/ted.env.example
+        dest: /etc/heimdall/ted.env.example
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Force any pending systemd reloads / restarts before enabling
+      meta: flush_handlers
+
+    - name: Enable and start heimdall@meeting.service
+      systemd:
+        name: heimdall@meeting.service
+        enabled: true
+        state: started
+        daemon_reload: true
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: true
+
+    - name: restart heimdall meeting
+      systemd:
+        name: heimdall@meeting.service
+        state: restarted
+        daemon_reload: true
+      failed_when: false

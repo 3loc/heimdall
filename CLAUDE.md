@@ -30,14 +30,37 @@ heimdall does **not** do transcription, screen-change detection, OCR, or any ML.
 ## Status
 
 - [x] Scaffolding + ansible playbook
-- [x] System packages installed (ffmpeg, v4l-utils, alsa-utils, pipewire stack, python)
+- [x] System packages installed (ffmpeg, v4l-utils, alsa-utils, openbsd-netcat, pipewire stack, python)
 - [x] **Day-3 milestone:** end-to-end UVC path proven on `agneta`
-  - Video frames flow from `/dev/video0` (Elgato → ffmpeg, NV12/YUYV @ 720p60)
-  - Audio flows from ALSA `hw:0` (Elgato USB-Audio Class, 48 kHz stereo, real music levels: -12.9 dB mean / -0.4 dB peak)
-  - **Constraint discovered:** a *single* ffmpeg process holding both `/dev/video0` and `hw:0` simultaneously starves the v4l2 video pipe (encodes ~0.6 fps instead of 30 fps). Two *separate* ffmpeg processes — one per input — work fine. Bug is in ffmpeg's input scheduler, not the kernel/USB layer. See `loki/docs/sessions/2026-04-08-elgato-stream-test.md`.
-  - **Design implication:** heimdall's audio path and video path will run as two processes (or one process opening only one device at a time). This already matches the production design — audio streams continuously to mimir, video grabs single frames on demand from odin.
-- [ ] Python module that opens the device and exposes audio + frame-grab API
-- [ ] systemd unit + integration with mimir/odin
+- [x] **Heimdall daemon written and running** as a systemd template service
+  - `repos/heimdall/src/heimdall.py` — pure stdlib Python, ~250 lines
+  - `repos/heimdall/systemd/heimdall@.service` — template unit, one instance per audio source
+  - `heimdall@meeting.service` is enabled and running on `agneta`, capturing the Elgato HDMI audio + video
+  - Audio fans out as 16 kHz mono PCM (s16le, Whisper-ready) on `/run/heimdall/meeting.sock`
+  - Video served on demand as PNG via `GET http://127.0.0.1:7100/frame.png`
+  - Stats and health on `/info` and `/healthz`
+  - Verified live: `make probe` shows the daemon active, `frames_served: 1+`, audio fanout delivering exactly 32 kB/s on the socket
+- [ ] `heimdall@ted.service` — placeholder env file at `/etc/heimdall/ted.env.example`. Activate when the USB mic for Ted's voice arrives: copy to `/etc/heimdall/ted.env`, set `HEIMDALL_AUDIO_DEVICE` to the new card index, `systemctl enable --now heimdall@ted.service`. No code changes required.
+- [ ] Integration with mimir (mimir consumes `/run/heimdall/meeting.sock` once it exists)
+- [ ] Integration with odin (odin calls `GET /frame.png` on foot pedal press once it exists)
+
+## Architecture summary
+
+Single Python process per ALSA source. Each instance:
+
+1. Spawns one long-lived `ffmpeg` child reading the configured ALSA device → 16 kHz mono PCM → stdin pipe.
+2. Reads that pipe in a fanout thread; broadcasts each 100 ms chunk to every connected subscriber on a Unix domain socket.
+3. Runs an HTTP server on 127.0.0.1 with `/healthz`, `/info`, and (if `HEIMDALL_VIDEO_ENABLED=1`) `/frame.png`.
+4. Each `/frame.png` request spawns a *short-lived* ffmpeg child to grab one PNG from `/dev/video0` and exits. The video device is **not** held open between grabs — that would conflict with the long-lived audio capture per the constraint discovered in the 2026-04-08 session note.
+
+**Two instances run concurrently when the Ted mic arrives:**
+
+| Instance | Audio | Video | Audio socket | HTTP |
+|---|---|---|---|---|
+| `heimdall@meeting` (now) | `hw:0` (Elgato) | yes | `/run/heimdall/meeting.sock` | `127.0.0.1:7100` |
+| `heimdall@ted` (later) | `hw:N` (USB mic) | no | `/run/heimdall/ted.sock` | `127.0.0.1:7101` |
+
+Mimir will subscribe to both sockets and tag each transcript chunk by source — no pyannote diarization needed (see ADR 0007).
 
 ## Layout
 

@@ -1,0 +1,43 @@
+[Unit]
+Description=heimdall HDMI capture (%i)
+Documentation=https://github.com/3loc/heimdall
+After=sound.target systemd-tmpfiles-setup.service
+Wants=sound.target
+
+[Service]
+Type=simple
+User=ted
+Group=ted
+
+# /run/heimdall is shared across instances so consumers (mimir, debug taps)
+# always look in the same place. RuntimeDirectoryPreserve keeps the directory
+# alive when one instance restarts so other instances' sockets aren't
+# disturbed.
+RuntimeDirectory=heimdall
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
+# Per-instance config. Required — the unit fails if the file is missing,
+# which is what we want (no silent defaults for a real instance).
+EnvironmentFile=/etc/heimdall/%i.env
+
+ExecStart=/usr/local/bin/heimdall
+
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+
+# Logs to journal under heimdall@<instance>.service
+StandardOutput=journal
+StandardError=journal
+
+# Mild sandboxing — heimdall only needs to read /dev/video0, /dev/snd,
+# and write to /run/heimdall.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=/run/heimdall
+
+[Install]
+WantedBy=multi-user.target
