@@ -1,0 +1,69 @@
+---
+# Deploys heimdall (HDMI capture module) to the local Minisforum.
+#
+# Idempotent: re-running this playbook on a clean host or an already-set-up
+# host should both succeed without side effects beyond the desired state.
+- name: Deploy heimdall (HDMI capture module)
+  hosts: agneta
+  become: true
+
+  vars:
+    heimdall_user: ted
+
+  tasks:
+    # --- System packages ---
+    - name: Install system packages required by heimdall
+      pacman:
+        name:
+          - ansible        # self-managed: heimdall's deploy tool is itself a managed package
+          - ffmpeg         # capture pipeline backbone
+          - v4l-utils      # /dev/video* introspection (v4l2-ctl)
+          - alsa-utils     # arecord, audio device introspection
+          - python         # heimdall's runtime language
+          - python-pip
+          - python-numpy
+          - git            # for pulling submodule-ish dependencies
+        state: present
+        update_cache: true
+
+    # --- Device access (no sudo needed at runtime) ---
+    - name: Add heimdall user to video group (UVC /dev/video* access)
+      user:
+        name: "{{ heimdall_user }}"
+        groups: video
+        append: true
+
+    - name: Add heimdall user to audio group (ALSA capture access)
+      user:
+        name: "{{ heimdall_user }}"
+        groups: audio
+        append: true
+
+    - name: Add heimdall user to input group (foot pedal /dev/input access)
+      user:
+        name: "{{ heimdall_user }}"
+        groups: input
+        append: true
+
+    # --- Verify the Elgato is actually present ---
+    - name: Probe for Elgato Game Capture Neo on USB
+      command: lsusb -d 0fd9:008c
+      register: elgato_probe
+      changed_when: false
+      failed_when: false
+
+    - name: Warn if Elgato is not currently plugged in
+      debug:
+        msg: "WARNING: Elgato Game Capture Neo (0fd9:008c) not found on USB. Plug it in before running capture."
+      when: elgato_probe.rc != 0
+
+    - name: Confirm /dev/video0 exists when Elgato is present
+      stat:
+        path: /dev/video0
+      register: video0_stat
+      when: elgato_probe.rc == 0
+
+    - name: Show /dev/video0 status
+      debug:
+        msg: "/dev/video0 present: {{ video0_stat.stat.exists | default(false) }}"
+      when: elgato_probe.rc == 0

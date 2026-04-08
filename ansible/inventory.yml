@@ -1,0 +1,10 @@
+---
+# heimdall is deployed to the same host it runs on. The Minisforum
+# (agneta) reaches itself via ansible_connection: local — no SSH.
+all:
+  hosts:
+    agneta:
+      ansible_host: localhost
+      ansible_connection: local
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
