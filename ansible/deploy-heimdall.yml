@@ -20,6 +20,13 @@
           - v4l-utils      # /dev/video* introspection (v4l2-ctl)
           - alsa-utils     # arecord, audio device introspection
           - openbsd-netcat # nc -U for ad-hoc Unix-socket debug from the shell
+          # mDNS resolution so agneta is reachable as agneta.local from
+          # macOS/Linux/Pi clients on the LAN. Eliminates the need to
+          # hardcode agneta's IP in odin/heimdall config or in the
+          # loki-meeting Claude skill — `agneta.local` is stable across
+          # LAN moves and DHCP renewals.
+          - avahi
+          - nss-mdns
           # PipeWire stack — required because the Elgato exposes video and
           # audio as the same UVC USB device, and concurrent direct opens of
           # /dev/video0 + ALSA hw:0 starve the v4l2 endpoint at the kernel
@@ -83,6 +90,25 @@
         name: "{{ heimdall_user }}"
         groups: input
         append: true
+
+    # --- mDNS hostname resolution ---
+    - name: Enable and start avahi-daemon
+      systemd:
+        name: avahi-daemon
+        enabled: true
+        state: started
+
+    - name: Add mdns_minimal to /etc/nsswitch.conf hosts line
+      lineinfile:
+        path: /etc/nsswitch.conf
+        regexp: '^hosts:'
+        line: 'hosts: mymachines mdns_minimal [NOTFOUND=return] resolve [!UNAVAIL=return] files myhostname dns'
+      register: nsswitch_change
+
+    - name: Note if nsswitch changed
+      debug:
+        msg: "nsswitch.conf updated — mDNS resolution enabled (agneta.local should now resolve)"
+      when: nsswitch_change.changed
 
     # --- Verify the Elgato is actually present ---
     - name: Probe for Elgato Game Capture Neo on USB
