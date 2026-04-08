@@ -45,6 +45,8 @@ import http.server
 import json
 import logging
 import os
+import re
+import select
 import signal
 import socket
 import socketserver
@@ -58,7 +60,22 @@ from pathlib import Path
 # ─── config ──────────────────────────────────────────────────────────────────
 
 LABEL = os.environ.get("HEIMDALL_LABEL", "default")
-AUDIO_DEVICE = os.environ.get("HEIMDALL_AUDIO_DEVICE", "hw:0")
+
+# Audio capture device. There are two ways to specify it:
+#
+#   HEIMDALL_AUDIO_CARD_NAME — preferred. We look up the ALSA card by
+#       its persistent name in /proc/asound/cards, which survives
+#       unplug/replug even if the card index changes (a USB device
+#       removed and re-added may come back as hw:1 instead of hw:0).
+#       Default "Neo" matches the Elgato Game Capture Neo.
+#
+#   HEIMDALL_AUDIO_DEVICE — escape hatch. If set, used as a literal
+#       ALSA device string (e.g. "hw:0", "plughw:Neo,0", "default").
+#       Bypasses the dynamic lookup. Useful if you want to point at a
+#       fixed non-Elgato source.
+AUDIO_CARD_NAME = os.environ.get("HEIMDALL_AUDIO_CARD_NAME", "Neo")
+AUDIO_DEVICE_OVERRIDE = os.environ.get("HEIMDALL_AUDIO_DEVICE", "").strip()
+
 AUDIO_SOCKET_PATH = Path(
     os.environ.get("HEIMDALL_AUDIO_SOCKET", f"/run/heimdall/{LABEL}.sock")
 )
@@ -68,6 +85,12 @@ VIDEO_ENABLED = os.environ.get("HEIMDALL_VIDEO_ENABLED", "0") == "1"
 VIDEO_DEVICE = os.environ.get("HEIMDALL_VIDEO_DEVICE", "/dev/video0")
 HTTP_HOST = os.environ.get("HEIMDALL_HTTP_HOST", "127.0.0.1")
 HTTP_PORT = int(os.environ.get("HEIMDALL_HTTP_PORT", "7100"))
+
+# How long to wait on the audio pipe before declaring ffmpeg wedged
+# and restarting it. The Elgato produces audio at ~32 kB/s when alive,
+# so any silence > a few seconds means something is wrong (HDMI signal
+# loss, USB suspend, ffmpeg internal hang, etc).
+AUDIO_READ_TIMEOUT_SEC = 5.0
 
 # 100 ms PCM chunks (16 kHz × 1 ch × 2 bytes / 10 = 3200 bytes)
 CHUNK_BYTES = AUDIO_RATE * AUDIO_CHANNELS * 2 // 10
@@ -96,7 +119,9 @@ _FRAME_CACHE_TTL_SEC = 0.5
 
 stats: dict = {
     "label": LABEL,
-    "audio_device": AUDIO_DEVICE,
+    "audio_card_name": AUDIO_CARD_NAME,
+    "audio_device_override": AUDIO_DEVICE_OVERRIDE or None,
+    "audio_device_resolved": None,  # filled in once we open it
     "audio_rate": AUDIO_RATE,
     "audio_channels": AUDIO_CHANNELS,
     "audio_socket": str(AUDIO_SOCKET_PATH),
@@ -106,6 +131,7 @@ stats: dict = {
     "started_at": None,
     "audio_bytes": 0,
     "audio_subscribers": 0,
+    "audio_ffmpeg_restarts": 0,
     "frames_served": 0,
     "frame_errors": 0,
     "last_frame_at": None,
@@ -114,11 +140,48 @@ stats: dict = {
 
 # ─── audio capture ───────────────────────────────────────────────────────────
 
-def start_audio_ffmpeg() -> subprocess.Popen:
+def find_alsa_card_index(name: str) -> int | None:
+    """Look up an ALSA card's integer index by its persistent card name.
+
+    The card name is the bracketed identifier in /proc/asound/cards,
+    e.g. " 0 [Neo            ]: USB-Audio - Elgato Game Capture Neo".
+    USB hotplug can change the integer index (Elgato might come back
+    as hw:1 after a replug), but the name stays the same.
+
+    Returns None if the card isn't currently registered with the
+    kernel — i.e. the device is unplugged.
+    """
+    try:
+        with open("/proc/asound/cards") as f:
+            for line in f:
+                m = re.match(r"\s*(\d+)\s+\[(\S+)\s*\]", line)
+                if m and m.group(2) == name:
+                    return int(m.group(1))
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def resolve_audio_device() -> str | None:
+    """Compute the ALSA device string to pass to ffmpeg, or None if absent.
+
+    If HEIMDALL_AUDIO_DEVICE is set, use it verbatim (escape hatch).
+    Otherwise look up HEIMDALL_AUDIO_CARD_NAME in /proc/asound/cards
+    and build hw:N from the resolved index.
+    """
+    if AUDIO_DEVICE_OVERRIDE:
+        return AUDIO_DEVICE_OVERRIDE
+    idx = find_alsa_card_index(AUDIO_CARD_NAME)
+    if idx is None:
+        return None
+    return f"hw:{idx}"
+
+
+def start_audio_ffmpeg(device: str) -> subprocess.Popen:
     cmd = [
         "ffmpeg",
         "-hide_banner", "-loglevel", "error", "-nostats",
-        "-f", "alsa", "-i", AUDIO_DEVICE,
+        "-f", "alsa", "-i", device,
         "-ac", str(AUDIO_CHANNELS),
         "-ar", str(AUDIO_RATE),
         "-f", "s16le",
@@ -130,27 +193,103 @@ def start_audio_ffmpeg() -> subprocess.Popen:
     )
 
 
+def _terminate_audio_proc(proc: subprocess.Popen) -> None:
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 def audio_pump_loop() -> None:
-    """Read PCM from the ffmpeg child, fan out to all connected subscribers."""
+    """Long-lived: keep PCM flowing from the configured ALSA card to subscribers.
+
+    Recovery loop. On every iteration: wait for the device to be
+    present, spawn ffmpeg, read with a select() timeout, and broadcast
+    chunks. Any failure (device gone, ffmpeg EOF, read timeout, etc.)
+    cleans up ffmpeg and loops back to the top with exponential
+    backoff. The loop only exits if shutdown_event is set.
+
+    This means heimdall survives:
+      * The Elgato being physically unplugged and re-plugged at any
+        delay (the card index can even change — we look it up by name).
+      * HDMI signal loss / source machine sleeping the display.
+      * ffmpeg crashing or hanging mid-stream.
+      * USB autosuspend.
+
+    Without restarting the daemon, without losing TCP/HTTP/Unix-socket
+    state, without dropping connected subscribers (mimir keeps its
+    connection open and just sees a quiet period until audio resumes).
+    """
     global audio_proc
-    audio_proc = start_audio_ffmpeg()
-    try:
-        while not shutdown_event.is_set():
-            chunk = audio_proc.stdout.read(CHUNK_BYTES)
-            if not chunk:
-                stderr = audio_proc.stderr.read().decode("utf-8", errors="replace")
-                log.error("audio: ffmpeg stdout closed; stderr=%s", stderr.strip())
-                break
-            stats["audio_bytes"] += len(chunk)
-            _broadcast(chunk)
-    finally:
-        if audio_proc and audio_proc.poll() is None:
-            audio_proc.terminate()
-            try:
-                audio_proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                audio_proc.kill()
-        log.info("audio: pump exited")
+    backoff = 0.5
+    while not shutdown_event.is_set():
+        # 1. Wait for the device to be present.
+        device = resolve_audio_device()
+        if device is None:
+            log.warning(
+                "audio: ALSA card %r not present in /proc/asound/cards; "
+                "waiting %.1fs",
+                AUDIO_CARD_NAME, backoff,
+            )
+            stats["audio_device_resolved"] = None
+            shutdown_event.wait(backoff)
+            backoff = min(backoff * 2, 5.0)
+            continue
+
+        # 2. Spawn ffmpeg.
+        try:
+            audio_proc = start_audio_ffmpeg(device)
+        except Exception as e:
+            log.error("audio: failed to spawn ffmpeg: %s", e)
+            shutdown_event.wait(backoff)
+            backoff = min(backoff * 2, 5.0)
+            continue
+
+        stats["audio_device_resolved"] = device
+        stats["audio_ffmpeg_restarts"] += 1
+        log.info("audio: ffmpeg up (device=%s, restart#%d)",
+                 device, stats["audio_ffmpeg_restarts"])
+        backoff = 0.5  # reset backoff after a successful start
+
+        # 3. Read loop with select() timeout.
+        stdout_fd = audio_proc.stdout.fileno()
+        try:
+            while not shutdown_event.is_set():
+                ready, _, _ = select.select([stdout_fd], [], [], AUDIO_READ_TIMEOUT_SEC)
+                if not ready:
+                    log.warning(
+                        "audio: no data from ffmpeg in %.0fs; assuming wedged, "
+                        "restarting",
+                        AUDIO_READ_TIMEOUT_SEC,
+                    )
+                    break
+                try:
+                    chunk = os.read(stdout_fd, CHUNK_BYTES)
+                except OSError as e:
+                    log.warning("audio: read error: %s", e)
+                    break
+                if not chunk:
+                    # EOF — ffmpeg exited (Elgato unplugged, kernel
+                    # closed the device, etc.). Don't try to read
+                    # stderr here; it might also be closed and would
+                    # block. The next iteration will pick up the new
+                    # state.
+                    log.warning("audio: ffmpeg EOF (rc=%s)", audio_proc.poll())
+                    break
+                stats["audio_bytes"] += len(chunk)
+                _broadcast(chunk)
+        finally:
+            _terminate_audio_proc(audio_proc)
+            audio_proc = None
+
+        if not shutdown_event.is_set():
+            log.info("audio: will retry in %.1fs", backoff)
+            shutdown_event.wait(backoff)
+            backoff = min(backoff * 2, 5.0)
+
+    log.info("audio: pump exited")
 
 
 def _broadcast(chunk: bytes) -> None:
@@ -235,6 +374,19 @@ def audio_socket_loop() -> None:
 
 
 # ─── video frame grab ────────────────────────────────────────────────────────
+
+def video_device_present() -> bool:
+    """Quick check whether the v4l2 device file exists right now.
+
+    Used by the HTTP handler to return 503 ("device not available")
+    instead of 500 ("frame grab failed") when the Elgato is unplugged.
+    Cheap stat — no ffmpeg spawn.
+    """
+    try:
+        return Path(VIDEO_DEVICE).exists()
+    except OSError:
+        return False
+
 
 def grab_frame() -> bytes | None:
     """Spawn a short-lived ffmpeg to grab a single PNG frame.
@@ -336,6 +488,18 @@ class HeimdallHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/frame.png":
             if not VIDEO_ENABLED:
                 return self.send_error(404, "video not enabled on this instance")
+            # If the v4l2 device file is missing, the Elgato is unplugged.
+            # Skip the ffmpeg spawn (which would fail with rc!=0 in ~50ms
+            # anyway) and serve the cached frame if we have a recent one,
+            # otherwise return 503 so the client knows it's a transient
+            # device-gone state, not a code bug.
+            if not video_device_present():
+                if _cached_frame_bytes:
+                    age = time.monotonic() - _cached_frame_at
+                    log.info("video: device %s missing, serving cached frame (%.0fms old)",
+                             VIDEO_DEVICE, age * 1000)
+                    return self._send(200, _cached_frame_bytes, "image/png")
+                return self.send_error(503, f"video device {VIDEO_DEVICE} not available")
             png = grab_frame()
             if png is None:
                 return self.send_error(500, "frame grab failed")
@@ -386,8 +550,12 @@ def main() -> None:
 
     stats["started_at"] = time.time()
     log.info(
-        "heimdall starting: label=%s audio=%s video=%s http=%s:%d",
-        LABEL, AUDIO_DEVICE, "yes" if VIDEO_ENABLED else "no", HTTP_HOST, HTTP_PORT,
+        "heimdall starting: label=%s audio_card=%s%s video=%s http=%s:%d",
+        LABEL,
+        AUDIO_CARD_NAME,
+        f" (override={AUDIO_DEVICE_OVERRIDE})" if AUDIO_DEVICE_OVERRIDE else "",
+        "yes" if VIDEO_ENABLED else "no",
+        HTTP_HOST, HTTP_PORT,
     )
 
     threads = [
