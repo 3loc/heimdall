@@ -19,12 +19,50 @@
           - ffmpeg         # capture pipeline backbone
           - v4l-utils      # /dev/video* introspection (v4l2-ctl)
           - alsa-utils     # arecord, audio device introspection
+          # PipeWire stack — required because the Elgato exposes video and
+          # audio as the same UVC USB device, and concurrent direct opens of
+          # /dev/video0 + ALSA hw:0 starve the v4l2 endpoint at the kernel
+          # level. PipeWire holds the raw ALSA device and lets ffmpeg pull
+          # audio via the pulse compatibility layer without contention.
+          - pipewire
+          - pipewire-pulse
+          - pipewire-alsa
+          - wireplumber
           - python         # heimdall's runtime language
           - python-pip
           - python-numpy
           - git            # for pulling submodule-ish dependencies
         state: present
         update_cache: true
+
+    # --- PipeWire user services ---
+    # Enable lingering so heimdall_user's systemd --user manager keeps
+    # running without an active login session. Required for headless
+    # operation (the box is reached over SSH only).
+    - name: Enable systemd lingering for heimdall_user
+      command: loginctl enable-linger {{ heimdall_user }}
+      args:
+        creates: "/var/lib/systemd/linger/{{ heimdall_user }}"
+
+    - name: Enable PipeWire user services for heimdall_user
+      become_user: "{{ heimdall_user }}"
+      command: systemctl --user enable --now {{ item }}
+      loop:
+        - pipewire.socket
+        - pipewire-pulse.socket
+        - wireplumber.service
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/1000"
+      register: pw_enable
+      changed_when: "'Created symlink' in (pw_enable.stderr | default(''))"
+      failed_when: false
+
+    # NOTE: PipeWire is installed and enabled but heimdall's capture path
+    # does not currently use it. Direct ALSA hw:0 + v4l2 /dev/video0 work
+    # fine when held by *separate* processes. See the 2026-04-08 session
+    # note in loki/docs/sessions/ for the test results that established
+    # this. PipeWire is kept here as a sensible default for the box and
+    # as a fallback option if we ever need audio multiplexing.
 
     # --- Device access (no sudo needed at runtime) ---
     - name: Add heimdall user to video group (UVC /dev/video* access)

@@ -30,9 +30,12 @@ heimdall does **not** do transcription, screen-change detection, OCR, or any ML.
 ## Status
 
 - [x] Scaffolding + ansible playbook
-- [x] System packages installed (ffmpeg, v4l-utils, alsa-utils, python)
-- [ ] Prove `/dev/video0` produces video frames via ffmpeg
-- [ ] Prove audio capture path (currently `arecord -l` shows no soundcards — needs investigation; UVC audio may need to be exposed via ALSA differently or pulled directly via ffmpeg's v4l2/alsa input)
+- [x] System packages installed (ffmpeg, v4l-utils, alsa-utils, pipewire stack, python)
+- [x] **Day-3 milestone:** end-to-end UVC path proven on `agneta`
+  - Video frames flow from `/dev/video0` (Elgato → ffmpeg, NV12/YUYV @ 720p60)
+  - Audio flows from ALSA `hw:0` (Elgato USB-Audio Class, 48 kHz stereo, real music levels: -12.9 dB mean / -0.4 dB peak)
+  - **Constraint discovered:** a *single* ffmpeg process holding both `/dev/video0` and `hw:0` simultaneously starves the v4l2 video pipe (encodes ~0.6 fps instead of 30 fps). Two *separate* ffmpeg processes — one per input — work fine. Bug is in ffmpeg's input scheduler, not the kernel/USB layer. See `loki/docs/sessions/2026-04-08-elgato-stream-test.md`.
+  - **Design implication:** heimdall's audio path and video path will run as two processes (or one process opening only one device at a time). This already matches the production design — audio streams continuously to mimir, video grabs single frames on demand from odin.
 - [ ] Python module that opens the device and exposes audio + frame-grab API
 - [ ] systemd unit + integration with mimir/odin
 
