@@ -227,14 +227,27 @@ def audio_socket_loop() -> None:
 def grab_frame() -> bytes | None:
     """Spawn a short-lived ffmpeg to grab a single PNG frame.
 
-    Note: ``-c:v png -f image2pipe`` is required to actually produce PNG.
-    Without ``-c:v png`` ffmpeg's image2 muxer guesses MJPEG when the
-    output is a pipe (because there is no filename extension to infer
-    from), and you get a JPEG even though the URL says .png.
+    Two ffmpeg flags are non-obvious here:
+
+    * ``-input_format nv12 -video_size 1920x1080 -framerate 30`` —
+      without these, v4l2 defaults to 1280x720 YUYV even though the
+      Elgato is receiving and capable of 1080p. Forcing the format
+      explicitly upgrades the grab to full HD, which is a real
+      legibility win for screenshots of small UI text. NV12 is
+      slightly less bandwidth than YUYV at the same dimensions; both
+      work, NV12 is the cheaper choice.
+    * ``-c:v png -f image2pipe`` is required to actually produce PNG.
+      Without ``-c:v png`` ffmpeg's image2 muxer guesses MJPEG when
+      the output is a pipe (because there is no filename extension to
+      infer from), and you get a JPEG even though the URL says .png.
     """
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-f", "v4l2", "-i", VIDEO_DEVICE,
+        "-f", "v4l2",
+        "-input_format", "nv12",
+        "-video_size", "1920x1080",
+        "-framerate", "30",
+        "-i", VIDEO_DEVICE,
         "-frames:v", "1",
         "-c:v", "png",
         "-f", "image2pipe",
