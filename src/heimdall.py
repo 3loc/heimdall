@@ -82,6 +82,18 @@ audio_subscribers: list[socket.socket] = []
 audio_subscribers_lock = threading.Lock()
 audio_proc: subprocess.Popen | None = None
 
+# Serializes concurrent /frame.png requests so only one ffmpeg at a time
+# holds /dev/video0 (v4l2 devices are exclusive — overlapping opens
+# return EBUSY). Also gates the small warm-frame cache below.
+_frame_grab_lock = threading.Lock()
+_cached_frame_bytes: bytes | None = None
+_cached_frame_at: float = 0.0
+# How long to serve a cached frame instead of grabbing fresh. A real
+# pedal-press is on the order of seconds apart, so 500ms is short
+# enough that nobody notices but long enough to deduplicate
+# refresh-storms (e.g. browser-refresh testing).
+_FRAME_CACHE_TTL_SEC = 0.5
+
 stats: dict = {
     "label": LABEL,
     "audio_device": AUDIO_DEVICE,
@@ -227,49 +239,86 @@ def audio_socket_loop() -> None:
 def grab_frame() -> bytes | None:
     """Spawn a short-lived ffmpeg to grab a single PNG frame.
 
-    Two ffmpeg flags are non-obvious here:
+    Three ffmpeg flags here are non-obvious, plus a serializing lock and
+    a small cache wrapping the call:
 
     * ``-input_format nv12 -video_size 1920x1080 -framerate 30`` —
       without these, v4l2 defaults to 1280x720 YUYV even though the
       Elgato is receiving and capable of 1080p. Forcing the format
       explicitly upgrades the grab to full HD, which is a real
       legibility win for screenshots of small UI text. NV12 is
-      slightly less bandwidth than YUYV at the same dimensions; both
-      work, NV12 is the cheaper choice.
+      slightly less bandwidth than YUYV at the same dimensions.
+
+    * ``-vf "select='gte(n\\,10)'" -vsync 0`` discards the first 10
+      frames after STREAMON. Fresh-opened v4l2 devices return stale
+      buffers or all-zero black frames for the first few hundred ms
+      while the capture pipeline ramps up — taking frame 0 with
+      ``-frames:v 1`` reliably gives garbage on the Elgato. Skipping
+      to frame 10 (~333ms at 30fps) gives clean content every time.
+
     * ``-c:v png -f image2pipe`` is required to actually produce PNG.
       Without ``-c:v png`` ffmpeg's image2 muxer guesses MJPEG when
       the output is a pipe (because there is no filename extension to
       infer from), and you get a JPEG even though the URL says .png.
+
+    On top of ffmpeg, the function takes ``_frame_grab_lock`` to
+    serialize concurrent grabs (otherwise overlapping HTTP requests
+    race for /dev/video0 and one or both get EBUSY and 500), and
+    serves a cached frame for FRAME_CACHE_TTL after a successful grab
+    so refresh-storms don't hammer the device.
     """
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-f", "v4l2",
-        "-input_format", "nv12",
-        "-video_size", "1920x1080",
-        "-framerate", "30",
-        "-i", VIDEO_DEVICE,
-        "-frames:v", "1",
-        "-c:v", "png",
-        "-f", "image2pipe",
-        "-",
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, timeout=10)
-    except subprocess.TimeoutExpired:
-        log.error("video: frame grab timed out")
-        stats["frame_errors"] += 1
-        return None
-    if result.returncode != 0 or not result.stdout:
-        log.error(
-            "video: ffmpeg failed rc=%d stderr=%s",
-            result.returncode,
-            result.stderr.decode("utf-8", errors="replace").strip(),
-        )
-        stats["frame_errors"] += 1
-        return None
-    stats["frames_served"] += 1
-    stats["last_frame_at"] = time.time()
-    return result.stdout
+    global _cached_frame_bytes, _cached_frame_at
+
+    with _frame_grab_lock:
+        # Serve cached if recent enough.
+        now = time.monotonic()
+        if _cached_frame_bytes and (now - _cached_frame_at) < _FRAME_CACHE_TTL_SEC:
+            age_ms = (now - _cached_frame_at) * 1000
+            log.info("video: served cached frame (%.0fms old, %d bytes)",
+                     age_ms, len(_cached_frame_bytes))
+            stats["frames_served"] += 1
+            stats["last_frame_at"] = time.time()
+            return _cached_frame_bytes
+
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "v4l2",
+            "-input_format", "nv12",
+            "-video_size", "1920x1080",
+            "-framerate", "30",
+            "-i", VIDEO_DEVICE,
+            "-vf", "select='gte(n\\,10)'",
+            "-vsync", "0",
+            "-frames:v", "1",
+            "-c:v", "png",
+            "-f", "image2pipe",
+            "-",
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            log.error("video: frame grab timed out")
+            stats["frame_errors"] += 1
+            return None
+        if result.returncode != 0 or not result.stdout:
+            log.error(
+                "video: ffmpeg failed rc=%d stderr=%s",
+                result.returncode,
+                result.stderr.decode("utf-8", errors="replace").strip(),
+            )
+            stats["frame_errors"] += 1
+            return None
+
+        # Set cache timestamp AFTER ffmpeg returns, not before. If we
+        # used the pre-ffmpeg `now`, the cache TTL would burn through
+        # the 1+ seconds ffmpeg takes and a request that arrives
+        # immediately after the lock is released would see an "old"
+        # frame and refetch — defeating the cache.
+        _cached_frame_bytes = result.stdout
+        _cached_frame_at = time.monotonic()
+        stats["frames_served"] += 1
+        stats["last_frame_at"] = time.time()
+        return result.stdout
 
 
 # ─── HTTP server ─────────────────────────────────────────────────────────────
