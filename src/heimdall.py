@@ -14,16 +14,25 @@ a USB mic on agneta and have video disabled.
 Configuration is by environment variable, normally set via a systemd
 EnvironmentFile per instance:
 
-    HEIMDALL_LABEL              instance name (default: "default")
-    HEIMDALL_AUDIO_DEVICE       ALSA capture device (default: "hw:0")
-    HEIMDALL_AUDIO_SOCKET       fan-out Unix socket path
-                                (default: /run/heimdall/$LABEL.sock)
-    HEIMDALL_AUDIO_RATE         sample rate Hz (default: 16000)
-    HEIMDALL_AUDIO_CHANNELS     channels, downmixed by ffmpeg (default: 1)
-    HEIMDALL_VIDEO_ENABLED      "1" to expose /frame.png (default: "0")
-    HEIMDALL_VIDEO_DEVICE       v4l2 device (default: /dev/video0)
-    HEIMDALL_HTTP_HOST          HTTP bind address (default: 127.0.0.1)
-    HEIMDALL_HTTP_PORT          HTTP bind port (default: 7100)
+    HEIMDALL_LABEL                       instance name (default: "default")
+    HEIMDALL_AUDIO_CARD_NAME             ALSA card name to look up in
+                                         /proc/asound/cards (default: "Neo").
+                                         Special value "auto" picks the first
+                                         capture-capable card not in the
+                                         exclude list, preferring USB-Audio.
+    HEIMDALL_AUDIO_AUTODETECT_EXCLUDE    comma-separated card names to skip
+                                         when CARD_NAME=auto (default: "Neo")
+    HEIMDALL_AUDIO_DEVICE                literal ALSA device escape hatch,
+                                         e.g. "hw:0", "plughw:Neo,0".
+                                         Bypasses card-name lookup entirely.
+    HEIMDALL_AUDIO_SOCKET                fan-out Unix socket path
+                                         (default: /run/heimdall/$LABEL.sock)
+    HEIMDALL_AUDIO_RATE                  sample rate Hz (default: 16000)
+    HEIMDALL_AUDIO_CHANNELS              channels, downmixed by ffmpeg (default: 1)
+    HEIMDALL_VIDEO_ENABLED               "1" to expose /frame.png (default: "0")
+    HEIMDALL_VIDEO_DEVICE                v4l2 device (default: /dev/video0)
+    HEIMDALL_HTTP_HOST                   HTTP bind address (default: 127.0.0.1)
+    HEIMDALL_HTTP_PORT                   HTTP bind port (default: 7100)
 
 Endpoints (always served — /frame.png 404s when video is disabled):
 
@@ -61,20 +70,35 @@ from pathlib import Path
 
 LABEL = os.environ.get("HEIMDALL_LABEL", "default")
 
-# Audio capture device. There are two ways to specify it:
-#
-#   HEIMDALL_AUDIO_CARD_NAME — preferred. We look up the ALSA card by
-#       its persistent name in /proc/asound/cards, which survives
-#       unplug/replug even if the card index changes (a USB device
-#       removed and re-added may come back as hw:1 instead of hw:0).
-#       Default "Neo" matches the Elgato Game Capture Neo.
+# Audio capture device. Three ways to specify it, in priority order:
 #
 #   HEIMDALL_AUDIO_DEVICE — escape hatch. If set, used as a literal
 #       ALSA device string (e.g. "hw:0", "plughw:Neo,0", "default").
-#       Bypasses the dynamic lookup. Useful if you want to point at a
-#       fixed non-Elgato source.
+#       Bypasses all card-name resolution. Useful if you want to point
+#       at a fixed non-USB source.
+#
+#   HEIMDALL_AUDIO_CARD_NAME=<name> — preferred for known devices.
+#       We look up the ALSA card by its persistent name in
+#       /proc/asound/cards, which survives unplug/replug even if the
+#       card index changes (a USB device removed and re-added may come
+#       back as hw:1 instead of hw:0). Default "Neo" matches the
+#       Elgato Game Capture Neo.
+#
+#   HEIMDALL_AUDIO_CARD_NAME=auto — preferred for "use whatever mic
+#       is plugged in". Scans /proc/asound/cards for capture-capable
+#       cards, skips any name in HEIMDALL_AUDIO_AUTODETECT_EXCLUDE
+#       (default "Neo" — so an auto instance never accidentally claims
+#       the Elgato away from heimdall@meeting), prefers USB-Audio over
+#       internal HDA codecs, and picks the lowest-index match. Re-runs
+#       on every recovery loop iteration so the result tracks live
+#       hotplug state.
 AUDIO_CARD_NAME = os.environ.get("HEIMDALL_AUDIO_CARD_NAME", "Neo")
 AUDIO_DEVICE_OVERRIDE = os.environ.get("HEIMDALL_AUDIO_DEVICE", "").strip()
+AUDIO_AUTODETECT_EXCLUDE = {
+    s.strip()
+    for s in os.environ.get("HEIMDALL_AUDIO_AUTODETECT_EXCLUDE", "Neo").split(",")
+    if s.strip()
+}
 
 AUDIO_SOCKET_PATH = Path(
     os.environ.get("HEIMDALL_AUDIO_SOCKET", f"/run/heimdall/{LABEL}.sock")
@@ -127,6 +151,8 @@ _FRAME_CACHE_TTL_SEC = 0.5
 stats: dict = {
     "label": LABEL,
     "audio_card_name": AUDIO_CARD_NAME,
+    "audio_card_name_resolved": None,  # filled in by auto-detect if active
+    "audio_autodetect_exclude": sorted(AUDIO_AUTODETECT_EXCLUDE),
     "audio_device_override": AUDIO_DEVICE_OVERRIDE or None,
     "audio_device_resolved": None,  # filled in once we open it
     "audio_rate": AUDIO_RATE,
@@ -150,6 +176,55 @@ stats: dict = {
 
 # ─── audio capture ───────────────────────────────────────────────────────────
 
+# /proc/asound/cards header line format:
+#   " 3 [C920           ]: USB-Audio - HD Pro Webcam C920"
+# Capture groups: index, short name, driver class.
+_ALSA_CARD_LINE_RE = re.compile(r"^\s*(\d+)\s+\[(\S+)\s*\]:\s*(\S+)")
+
+
+def list_alsa_cards() -> list[dict]:
+    """Return one dict per ALSA card currently registered with the kernel.
+
+    Each dict has: index (int), name (str), driver (str, e.g.
+    "USB-Audio" or "HDA-Intel"), has_capture (bool — True iff the
+    card exposes at least one PCM capture device).
+
+    Returns an empty list if /proc/asound/cards is unreadable. Sorted
+    by index ascending so callers can rely on deterministic ordering.
+    """
+    cards: list[dict] = []
+    try:
+        with open("/proc/asound/cards") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return cards
+
+    for line in text.splitlines():
+        m = _ALSA_CARD_LINE_RE.match(line)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        # Capture-capable iff /proc/asound/cardN contains any "pcm*c"
+        # entry. Playback-only cards (e.g. HDMI audio sinks) won't
+        # have any pcmXc files and we'll correctly skip them.
+        has_capture = False
+        try:
+            for entry in os.listdir(f"/proc/asound/card{idx}"):
+                if re.match(r"pcm\d+c", entry):
+                    has_capture = True
+                    break
+        except FileNotFoundError:
+            pass
+        cards.append({
+            "index": idx,
+            "name": m.group(2),
+            "driver": m.group(3),
+            "has_capture": has_capture,
+        })
+    cards.sort(key=lambda c: c["index"])
+    return cards
+
+
 def find_alsa_card_index(name: str) -> int | None:
     """Look up an ALSA card's integer index by its persistent card name.
 
@@ -161,26 +236,65 @@ def find_alsa_card_index(name: str) -> int | None:
     Returns None if the card isn't currently registered with the
     kernel — i.e. the device is unplugged.
     """
-    try:
-        with open("/proc/asound/cards") as f:
-            for line in f:
-                m = re.match(r"\s*(\d+)\s+\[(\S+)\s*\]", line)
-                if m and m.group(2) == name:
-                    return int(m.group(1))
-    except FileNotFoundError:
-        pass
+    for card in list_alsa_cards():
+        if card["name"] == name:
+            return card["index"]
     return None
+
+
+def autodetect_capture_card(exclude: set[str]) -> tuple[int, str] | None:
+    """Pick a capture-capable ALSA card to use as the audio source.
+
+    Heuristic, in order:
+      1. Drop any card whose name is in `exclude` (default "Neo" so we
+         never accidentally claim the Elgato from heimdall@meeting).
+      2. Drop any card without a PCM capture device.
+      3. Prefer USB-Audio class cards (i.e. plugged-in mics, headsets,
+         webcams) over HDA-Intel and other internal codecs.
+      4. Within the preferred class, pick the lowest card index for
+         deterministic ordering.
+
+    Returns (index, name) on success, or None if no candidate exists.
+    Re-evaluated every recovery loop iteration in audio_pump_loop, so
+    the choice tracks live hotplug — unplug the C920 and the next
+    iteration picks the next best capture device, plug it back in and
+    the iteration after picks the C920 again.
+    """
+    candidates = [
+        c for c in list_alsa_cards()
+        if c["has_capture"] and c["name"] not in exclude
+    ]
+    if not candidates:
+        return None
+    usb = [c for c in candidates if c["driver"] == "USB-Audio"]
+    pick = usb[0] if usb else candidates[0]
+    return (pick["index"], pick["name"])
 
 
 def resolve_audio_device() -> str | None:
     """Compute the ALSA device string to pass to ffmpeg, or None if absent.
 
-    If HEIMDALL_AUDIO_DEVICE is set, use it verbatim (escape hatch).
-    Otherwise look up HEIMDALL_AUDIO_CARD_NAME in /proc/asound/cards
-    and build hw:N from the resolved index.
+    Priority:
+      1. HEIMDALL_AUDIO_DEVICE — used verbatim (escape hatch).
+      2. HEIMDALL_AUDIO_CARD_NAME == "auto" — auto-detect any plugged-in
+         capture device, respecting HEIMDALL_AUDIO_AUTODETECT_EXCLUDE.
+      3. HEIMDALL_AUDIO_CARD_NAME == "<name>" — look up that exact card.
     """
     if AUDIO_DEVICE_OVERRIDE:
         return AUDIO_DEVICE_OVERRIDE
+    if AUDIO_CARD_NAME == "auto":
+        result = autodetect_capture_card(AUDIO_AUTODETECT_EXCLUDE)
+        if result is None:
+            return None
+        idx, name = result
+        # Stash the picked card name in stats so /info shows what
+        # auto-detect actually chose, not just "auto". Log only on
+        # change so the journal records hot-swap events without
+        # spamming on every recovery loop iteration.
+        if stats.get("audio_card_name_resolved") != name:
+            log.info("audio: auto-detected card %r at hw:%d", name, idx)
+            stats["audio_card_name_resolved"] = name
+        return f"hw:{idx}"
     idx = find_alsa_card_index(AUDIO_CARD_NAME)
     if idx is None:
         return None
@@ -238,11 +352,18 @@ def audio_pump_loop() -> None:
         # 1. Wait for the device to be present.
         device = resolve_audio_device()
         if device is None:
-            log.warning(
-                "audio: ALSA card %r not present in /proc/asound/cards; "
-                "waiting %.1fs",
-                AUDIO_CARD_NAME, backoff,
-            )
+            if AUDIO_CARD_NAME == "auto":
+                log.warning(
+                    "audio: no capture-capable ALSA card found "
+                    "(exclude=%s); waiting %.1fs",
+                    sorted(AUDIO_AUTODETECT_EXCLUDE), backoff,
+                )
+            else:
+                log.warning(
+                    "audio: ALSA card %r not present in /proc/asound/cards; "
+                    "waiting %.1fs",
+                    AUDIO_CARD_NAME, backoff,
+                )
             stats["audio_device_resolved"] = None
             shutdown_event.wait(backoff)
             backoff = min(backoff * 2, 5.0)
