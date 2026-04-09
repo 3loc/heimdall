@@ -702,14 +702,62 @@ class HeimdallHandler(http.server.BaseHTTPRequestHandler):
 
 
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """IPv6 dual-stack HTTP server.
+
+    The stock `http.server.HTTPServer` defaults to `AF_INET` — IPv4 only.
+    avahi-daemon on agneta announces both an A and an AAAA record for
+    `agneta.local`, and Chrome (and many other clients that use
+    happy-eyeballs with IPv6-preference) tries the AAAA first. If we're
+    only bound to IPv4 that attempt fails with `ERR_ADDRESS_UNREACHABLE`
+    before the client falls back to IPv4 — unless the client is willing
+    to race both, which curl does and Chrome sometimes doesn't.
+
+    Fix: bind to an IPv6 socket with `IPV6_V6ONLY=0`, which on Linux
+    accepts IPv4 connections as v4-mapped v6 addresses on the same
+    socket. One port, both address families, no duplicate accept loop.
+    `IPV6_V6ONLY=0` is already the Linux default, but we set it
+    explicitly so the behavior survives a `/proc/sys/net/ipv6/bindv6only`
+    change.
+    """
     daemon_threads = True
     allow_reuse_address = True
+    address_family = socket.AF_INET6
+
+    def server_bind(self) -> None:
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+
+def _resolve_bind_host(host: str) -> str:
+    """Translate IPv4-style wildcard/loopback addresses into IPv6 equivalents
+    so they work with the AF_INET6 dual-stack socket above.
+
+    Maps:
+      "0.0.0.0" / ""      → "::"       (wildcard, accepts v4 and v6)
+      "127.0.0.1"         → "::1"      (loopback — v6 loopback only, but
+                                         v4 loopback is generally covered by
+                                         mimir/odin running on the same host
+                                         as heimdall; this is a judgement call)
+
+    Other values are passed through unchanged. If you pin HEIMDALL_HTTP_HOST
+    to a specific v4 literal (e.g. a LAN IP), that may fail — use the v6
+    form or the host's mDNS name instead.
+    """
+    if host in ("0.0.0.0", ""):
+        return "::"
+    if host == "127.0.0.1":
+        return "::1"
+    return host
 
 
 def http_loop() -> None:
-    server = ThreadedHTTPServer((HTTP_HOST, HTTP_PORT), HeimdallHandler)
+    bind_host = _resolve_bind_host(HTTP_HOST)
+    server = ThreadedHTTPServer((bind_host, HTTP_PORT), HeimdallHandler)
     server.timeout = 1.0
-    log.info("http: listening on http://%s:%d", HTTP_HOST, HTTP_PORT)
+    log.info(
+        "http: listening on http://%s:%d (configured host=%s, dual-stack)",
+        bind_host, HTTP_PORT, HTTP_HOST,
+    )
     try:
         while not shutdown_event.is_set():
             server.handle_request()
