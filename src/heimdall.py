@@ -114,6 +114,12 @@ AUDIO_RATE = int(os.environ.get("HEIMDALL_AUDIO_RATE", "16000"))
 AUDIO_CHANNELS = int(os.environ.get("HEIMDALL_AUDIO_CHANNELS", "1"))
 VIDEO_ENABLED = os.environ.get("HEIMDALL_VIDEO_ENABLED", "0") == "1"
 VIDEO_DEVICE = os.environ.get("HEIMDALL_VIDEO_DEVICE", "/dev/video0")
+# Continuous background frame grabber. Keeps /dev/video0 open and a
+# rolling latest frame in memory at all times so the /snapshot.png POST
+# handler returns in <10 ms instead of the ~900 ms cold-ffmpeg-spawn
+# that users experience as "I have to wait before switching windows".
+# Set to 0 to disable the warmer and fall back to on-demand grabs.
+VIDEO_WARMER_FPS = int(os.environ.get("HEIMDALL_VIDEO_WARMER_FPS", "2"))
 HTTP_HOST = os.environ.get("HEIMDALL_HTTP_HOST", "127.0.0.1")
 HTTP_PORT = int(os.environ.get("HEIMDALL_HTTP_PORT", "7100"))
 
@@ -136,17 +142,23 @@ audio_subscribers: list[socket.socket] = []
 audio_subscribers_lock = threading.Lock()
 audio_proc: subprocess.Popen | None = None
 
-# Serializes concurrent /frame.png requests so only one ffmpeg at a time
-# holds /dev/video0 (v4l2 devices are exclusive — overlapping opens
-# return EBUSY). Also gates the small warm-frame cache below.
+# Serializes concurrent on-demand /frame.png cold-grabs. Only used as
+# a fallback when the warmer thread is down.
 _frame_grab_lock = threading.Lock()
-_cached_frame_bytes: bytes | None = None
-_cached_frame_at: float = 0.0
-# How long to serve a cached frame instead of grabbing fresh. A real
-# pedal-press is on the order of seconds apart, so 500ms is short
-# enough that nobody notices but long enough to deduplicate
-# refresh-storms (e.g. browser-refresh testing).
-_FRAME_CACHE_TTL_SEC = 0.5
+
+# The video warmer thread keeps a fresh PNG frame in memory at all
+# times. Both /frame.png GET and /snapshot.png POST read from here
+# instead of spawning a cold ffmpeg (which takes ~900 ms because of
+# v4l2 warm-up frame skipping). Updated by video_warmer_loop(),
+# read by grab_frame(). Thread-safe via Python's GIL for single
+# assignments (the bytes object is immutable and the float is atomic
+# under CPython).
+_warmer_frame: bytes | None = None
+_warmer_frame_at: float = 0.0
+# Max age (seconds) before we consider the warmer stale and fall back
+# to a cold grab. Should be well above 1/VIDEO_WARMER_FPS to allow
+# for occasional CPU pressure jitter. 5 seconds is generous.
+_WARMER_STALE_SEC = 5.0
 
 stats: dict = {
     "label": LABEL,
@@ -160,6 +172,9 @@ stats: dict = {
     "audio_socket": str(AUDIO_SOCKET_PATH),
     "video_enabled": VIDEO_ENABLED,
     "video_device": VIDEO_DEVICE if VIDEO_ENABLED else None,
+    "video_warmer_fps": VIDEO_WARMER_FPS if VIDEO_ENABLED else None,
+    "video_warmer_running": False,
+    "video_warmer_restarts": 0,
     "snapshot_path": str(SNAPSHOT_PATH),
     "http_endpoint": f"http://{HTTP_HOST}:{HTTP_PORT}",
     "started_at": None,
@@ -504,6 +519,120 @@ def audio_socket_loop() -> None:
         log.info("audio: socket loop exited")
 
 
+# ─── video warmer (continuous background frame grabber) ──────────────────────
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def video_warmer_loop() -> None:
+    """Continuously grab frames via a long-lived ffmpeg to keep a fresh
+    PNG always ready in ``_warmer_frame``.
+
+    The old model spawned a fresh ffmpeg per HTTP request, which took
+    ~900 ms (v4l2 open + 10-frame warm-up skip + PNG encode). This loop
+    spawns ONE ffmpeg that holds /dev/video0 open, writes PNG frames to
+    stdout continuously at VIDEO_WARMER_FPS, and we parse them out of
+    the pipe by PNG signature boundaries. ``grab_frame()`` then reads
+    ``_warmer_frame`` directly — sub-millisecond latency.
+
+    On ffmpeg crash / v4l2 loss / any error, the loop cleans up and
+    retries with exponential backoff, same pattern as audio_pump_loop.
+    """
+    global _warmer_frame, _warmer_frame_at
+
+    if not VIDEO_ENABLED or VIDEO_WARMER_FPS <= 0:
+        log.info("video warmer: disabled (VIDEO_ENABLED=%s, FPS=%s)",
+                 VIDEO_ENABLED, VIDEO_WARMER_FPS)
+        return
+
+    backoff = 0.5
+    while not shutdown_event.is_set():
+        if not video_device_present():
+            log.warning("video warmer: %s not present; waiting %.1fs",
+                        VIDEO_DEVICE, backoff)
+            shutdown_event.wait(backoff)
+            backoff = min(backoff * 2, 5.0)
+            continue
+
+        cmd = [
+            "ffmpeg",
+            "-hide_banner", "-loglevel", "error", "-nostats",
+            "-f", "v4l2",
+            "-input_format", "nv12",
+            "-video_size", "1920x1080",
+            "-framerate", str(VIDEO_WARMER_FPS),
+            "-i", VIDEO_DEVICE,
+            # No warm-up frame skip needed — the continuous pipeline
+            # produces a few dark frames at startup but then settles.
+            # The first good frame overwrites the dark ones within
+            # ~1 second, and the user won't press the pedal in the
+            # first second after heimdall boots.
+            "-c:v", "png",
+            "-f", "image2pipe",
+            "-",
+        ]
+        log.info("video warmer: starting ffmpeg at %d fps", VIDEO_WARMER_FPS)
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+            )
+        except Exception as e:
+            log.error("video warmer: failed to spawn ffmpeg: %s", e)
+            shutdown_event.wait(backoff)
+            backoff = min(backoff * 2, 5.0)
+            continue
+
+        stats["video_warmer_running"] = True
+        stats["video_warmer_restarts"] += 1
+        backoff = 0.5
+
+        # Read PNG frames from the pipe. PNGs in image2pipe are
+        # concatenated end-to-end. We split on the 8-byte PNG
+        # signature. Each frame is: signature + chunks + IEND.
+        buf = bytearray()
+        try:
+            while not shutdown_event.is_set():
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    log.warning("video warmer: ffmpeg stdout closed")
+                    break
+                buf.extend(chunk)
+                # Look for PNG boundaries. Each new signature marks
+                # the start of a new frame. Everything before it
+                # (except the very first frame's start) is the
+                # previous complete frame.
+                while True:
+                    # Find the SECOND signature in the buffer — that
+                    # marks the end of the FIRST complete frame.
+                    first = buf.find(_PNG_SIGNATURE)
+                    if first < 0:
+                        break
+                    second = buf.find(_PNG_SIGNATURE, first + 8)
+                    if second < 0:
+                        break  # incomplete frame, need more data
+                    # buf[first:second] is one complete PNG frame.
+                    frame = bytes(buf[first:second])
+                    del buf[:second]
+                    _warmer_frame = frame
+                    _warmer_frame_at = time.monotonic()
+        except OSError as e:
+            log.error("video warmer: read error: %s", e)
+        finally:
+            stats["video_warmer_running"] = False
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+
+        if not shutdown_event.is_set():
+            log.info("video warmer: restarting in %.1fs", backoff)
+            shutdown_event.wait(backoff)
+            backoff = min(backoff * 2, 5.0)
+
+    log.info("video warmer: exiting")
+
+
 # ─── video frame grab ────────────────────────────────────────────────────────
 
 def video_device_present() -> bool:
@@ -520,49 +649,42 @@ def video_device_present() -> bool:
 
 
 def grab_frame() -> bytes | None:
-    """Spawn a short-lived ffmpeg to grab a single PNG frame.
+    """Return the latest PNG frame, preferring the warmer's in-memory copy.
 
-    Three ffmpeg flags here are non-obvious, plus a serializing lock and
-    a small cache wrapping the call:
+    Fast path (sub-millisecond): read ``_warmer_frame`` which the
+    video_warmer_loop thread updates continuously at VIDEO_WARMER_FPS.
+    The frame is at most ~1/FPS seconds old, captured BEFORE the press
+    (not ~900 ms after, which was the old cold-grab behavior).
 
-    * ``-input_format nv12 -video_size 1920x1080 -framerate 30`` —
-      without these, v4l2 defaults to 1280x720 YUYV even though the
-      Elgato is receiving and capable of 1080p. Forcing the format
-      explicitly upgrades the grab to full HD, which is a real
-      legibility win for screenshots of small UI text. NV12 is
-      slightly less bandwidth than YUYV at the same dimensions.
-
-    * ``-vf "select='gte(n\\,10)'" -vsync 0`` discards the first 10
-      frames after STREAMON. Fresh-opened v4l2 devices return stale
-      buffers or all-zero black frames for the first few hundred ms
-      while the capture pipeline ramps up — taking frame 0 with
-      ``-frames:v 1`` reliably gives garbage on the Elgato. Skipping
-      to frame 10 (~333ms at 30fps) gives clean content every time.
-
-    * ``-c:v png -f image2pipe`` is required to actually produce PNG.
-      Without ``-c:v png`` ffmpeg's image2 muxer guesses MJPEG when
-      the output is a pipe (because there is no filename extension to
-      infer from), and you get a JPEG even though the URL says .png.
-
-    On top of ffmpeg, the function takes ``_frame_grab_lock`` to
-    serialize concurrent grabs (otherwise overlapping HTTP requests
-    race for /dev/video0 and one or both get EBUSY and 500), and
-    serves a cached frame for FRAME_CACHE_TTL after a successful grab
-    so refresh-storms don't hammer the device.
+    Fallback (~900 ms): if the warmer is down (``_warmer_frame`` is
+    None or stale beyond ``_WARMER_STALE_SEC``), spawn a one-shot
+    ffmpeg to grab a single frame the old way. This keeps heimdall
+    functional even if the warmer thread dies.
     """
-    global _cached_frame_bytes, _cached_frame_at
+    # Fast path: warmer has a recent frame.
+    frame = _warmer_frame
+    frame_at = _warmer_frame_at
+    if frame and (time.monotonic() - frame_at) < _WARMER_STALE_SEC:
+        age_ms = (time.monotonic() - frame_at) * 1000
+        log.info("video: served warmer frame (%.0fms old, %d bytes)",
+                 age_ms, len(frame))
+        stats["frames_served"] += 1
+        stats["last_frame_at"] = time.time()
+        return frame
 
+    # Fallback: cold grab (original ~900ms path).
+    log.warning("video: warmer frame stale or missing, falling back to cold grab")
+    return _cold_grab_frame()
+
+
+def _cold_grab_frame() -> bytes | None:
+    """Spawn a short-lived ffmpeg to grab a single PNG frame (fallback).
+
+    Only called when the video warmer is down. Takes ~900 ms due to
+    v4l2 warm-up frame skipping. Serialized via _frame_grab_lock so
+    concurrent requests don't race for /dev/video0 (which is exclusive).
+    """
     with _frame_grab_lock:
-        # Serve cached if recent enough.
-        now = time.monotonic()
-        if _cached_frame_bytes and (now - _cached_frame_at) < _FRAME_CACHE_TTL_SEC:
-            age_ms = (now - _cached_frame_at) * 1000
-            log.info("video: served cached frame (%.0fms old, %d bytes)",
-                     age_ms, len(_cached_frame_bytes))
-            stats["frames_served"] += 1
-            stats["last_frame_at"] = time.time()
-            return _cached_frame_bytes
-
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-f", "v4l2",
@@ -580,25 +702,18 @@ def grab_frame() -> bytes | None:
         try:
             result = subprocess.run(cmd, capture_output=True, timeout=10)
         except subprocess.TimeoutExpired:
-            log.error("video: frame grab timed out")
+            log.error("video: cold grab timed out")
             stats["frame_errors"] += 1
             return None
         if result.returncode != 0 or not result.stdout:
             log.error(
-                "video: ffmpeg failed rc=%d stderr=%s",
+                "video: cold grab ffmpeg failed rc=%d stderr=%s",
                 result.returncode,
                 result.stderr.decode("utf-8", errors="replace").strip(),
             )
             stats["frame_errors"] += 1
             return None
 
-        # Set cache timestamp AFTER ffmpeg returns, not before. If we
-        # used the pre-ffmpeg `now`, the cache TTL would burn through
-        # the 1+ seconds ffmpeg takes and a request that arrives
-        # immediately after the lock is released would see an "old"
-        # frame and refetch — defeating the cache.
-        _cached_frame_bytes = result.stdout
-        _cached_frame_at = time.monotonic()
         stats["frames_served"] += 1
         stats["last_frame_at"] = time.time()
         return result.stdout
@@ -796,6 +911,7 @@ def main() -> None:
     threads = [
         threading.Thread(target=audio_socket_loop, name="audio-sock", daemon=True),
         threading.Thread(target=audio_pump_loop, name="audio-pump", daemon=True),
+        threading.Thread(target=video_warmer_loop, name="video-warmer", daemon=True),
         threading.Thread(target=http_loop, name="http", daemon=True),
     ]
     for t in threads:
