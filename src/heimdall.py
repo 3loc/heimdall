@@ -309,7 +309,7 @@ def resolve_audio_device() -> str | None:
         if stats.get("audio_card_name_resolved") != name:
             log.info("audio: auto-detected card %r at hw:%d", name, idx)
             stats["audio_card_name_resolved"] = name
-        return f"hw:{idx}"
+        return f"plughw:{idx}"
     idx = find_alsa_card_index(AUDIO_CARD_NAME)
     if idx is None:
         return None
