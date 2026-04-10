@@ -112,6 +112,17 @@ SNAPSHOT_PATH = Path(
 )
 AUDIO_RATE = int(os.environ.get("HEIMDALL_AUDIO_RATE", "16000"))
 AUDIO_CHANNELS = int(os.environ.get("HEIMDALL_AUDIO_CHANNELS", "1"))
+# Optional ffmpeg audio filter chain applied BEFORE the PCM output.
+# Empty = no filter (passthrough). For the ted instance (close-talking
+# lavalier), a noise gate + highpass filter rejects background noise
+# and only passes speech from the mic's proximity zone:
+#
+#   HEIMDALL_AUDIO_FILTER=highpass=f=200,agate=threshold=0.015:ratio=8:attack=5:release=100
+#
+# The gate opens when signal exceeds ~threshold (-36 dB) — speech at
+# 6 inches from a lav mic is typically -20 to -10 dB, so 0.015 passes
+# speech comfortably and gates distant sounds / ambient noise.
+AUDIO_FILTER = os.environ.get("HEIMDALL_AUDIO_FILTER", "").strip()
 VIDEO_ENABLED = os.environ.get("HEIMDALL_VIDEO_ENABLED", "0") == "1"
 VIDEO_DEVICE = os.environ.get("HEIMDALL_VIDEO_DEVICE", "/dev/video0")
 # Continuous background frame grabber. Keeps /dev/video0 open and a
@@ -321,11 +332,15 @@ def start_audio_ffmpeg(device: str) -> subprocess.Popen:
         "ffmpeg",
         "-hide_banner", "-loglevel", "error", "-nostats",
         "-f", "alsa", "-i", device,
+    ]
+    if AUDIO_FILTER:
+        cmd.extend(["-af", AUDIO_FILTER])
+    cmd.extend([
         "-ac", str(AUDIO_CHANNELS),
         "-ar", str(AUDIO_RATE),
         "-f", "s16le",
         "-",
-    ]
+    ])
     log.info("audio: starting %s", " ".join(cmd))
     return subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
