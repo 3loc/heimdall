@@ -525,18 +525,27 @@ _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def video_warmer_loop() -> None:
-    """Continuously grab frames via a long-lived ffmpeg to keep a fresh
-    PNG always ready in ``_warmer_frame``.
+    """Periodically grab a frame in the background so press-1 is fast.
 
-    The old model spawned a fresh ffmpeg per HTTP request, which took
-    ~900 ms (v4l2 open + 10-frame warm-up skip + PNG encode). This loop
-    spawns ONE ffmpeg that holds /dev/video0 open, writes PNG frames to
-    stdout continuously at VIDEO_WARMER_FPS, and we parse them out of
-    the pipe by PNG signature boundaries. ``grab_frame()`` then reads
-    ``_warmer_frame`` directly — sub-millisecond latency.
+    Sleeps for 1/VIDEO_WARMER_FPS seconds, then does ONE cold grab
+    (the same ~900 ms ffmpeg spawn that grab_frame() used to do
+    inline). The result is stored in ``_warmer_frame``. When the user
+    presses the pedal, grab_frame() reads the cached frame instantly
+    (<1 ms) instead of blocking the HTTP response for ~900 ms.
 
-    On ffmpeg crash / v4l2 loss / any error, the loop cleans up and
-    retries with exponential backoff, same pattern as audio_pump_loop.
+    This is "v2" of the warmer. v1 used a continuous ffmpeg pipe
+    which maxed out all 8 cores because the Elgato's v4l2 driver
+    only supports 30 fps — ffmpeg read at 30 fps even though we
+    asked for 2, and burned CPU on every frame. This version spawns
+    a short-lived ffmpeg per iteration and releases /dev/video0
+    between grabs, keeping CPU usage to ~900 ms of work per cycle
+    (one core, intermittent) instead of 771% continuous.
+
+    Frame staleness: at most ``1/FPS + 0.9`` seconds (sleep interval
+    + grab duration). At the default 2 FPS that's ~1.4 s worst case,
+    which is fine for meetings where slides change on a seconds-to-
+    minutes timescale. The frame is captured BEFORE the pedal press,
+    not 900 ms after — which better matches user intent.
     """
     global _warmer_frame, _warmer_frame_at
 
@@ -545,91 +554,29 @@ def video_warmer_loop() -> None:
                  VIDEO_ENABLED, VIDEO_WARMER_FPS)
         return
 
-    backoff = 0.5
+    interval = 1.0 / VIDEO_WARMER_FPS
+    log.info(
+        "video warmer: starting (interval=%.1fs, cold-grab per cycle)",
+        interval,
+    )
+    stats["video_warmer_running"] = True
+
     while not shutdown_event.is_set():
         if not video_device_present():
-            log.warning("video warmer: %s not present; waiting %.1fs",
-                        VIDEO_DEVICE, backoff)
-            shutdown_event.wait(backoff)
-            backoff = min(backoff * 2, 5.0)
+            log.warning("video warmer: %s not present; sleeping %.1fs",
+                        VIDEO_DEVICE, interval)
+            shutdown_event.wait(interval)
             continue
 
-        cmd = [
-            "ffmpeg",
-            "-hide_banner", "-loglevel", "error", "-nostats",
-            "-f", "v4l2",
-            "-input_format", "nv12",
-            "-video_size", "1920x1080",
-            "-framerate", str(VIDEO_WARMER_FPS),
-            "-i", VIDEO_DEVICE,
-            # No warm-up frame skip needed — the continuous pipeline
-            # produces a few dark frames at startup but then settles.
-            # The first good frame overwrites the dark ones within
-            # ~1 second, and the user won't press the pedal in the
-            # first second after heimdall boots.
-            "-c:v", "png",
-            "-f", "image2pipe",
-            "-",
-        ]
-        log.info("video warmer: starting ffmpeg at %d fps", VIDEO_WARMER_FPS)
-        try:
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
-            )
-        except Exception as e:
-            log.error("video warmer: failed to spawn ffmpeg: %s", e)
-            shutdown_event.wait(backoff)
-            backoff = min(backoff * 2, 5.0)
-            continue
+        frame = _cold_grab_frame()
+        if frame is not None:
+            _warmer_frame = frame
+            _warmer_frame_at = time.monotonic()
+            stats["video_warmer_restarts"] += 1  # reuse counter as "grabs done"
 
-        stats["video_warmer_running"] = True
-        stats["video_warmer_restarts"] += 1
-        backoff = 0.5
+        shutdown_event.wait(interval)
 
-        # Read PNG frames from the pipe. PNGs in image2pipe are
-        # concatenated end-to-end. We split on the 8-byte PNG
-        # signature. Each frame is: signature + chunks + IEND.
-        buf = bytearray()
-        try:
-            while not shutdown_event.is_set():
-                chunk = proc.stdout.read(65536)
-                if not chunk:
-                    log.warning("video warmer: ffmpeg stdout closed")
-                    break
-                buf.extend(chunk)
-                # Look for PNG boundaries. Each new signature marks
-                # the start of a new frame. Everything before it
-                # (except the very first frame's start) is the
-                # previous complete frame.
-                while True:
-                    # Find the SECOND signature in the buffer — that
-                    # marks the end of the FIRST complete frame.
-                    first = buf.find(_PNG_SIGNATURE)
-                    if first < 0:
-                        break
-                    second = buf.find(_PNG_SIGNATURE, first + 8)
-                    if second < 0:
-                        break  # incomplete frame, need more data
-                    # buf[first:second] is one complete PNG frame.
-                    frame = bytes(buf[first:second])
-                    del buf[:second]
-                    _warmer_frame = frame
-                    _warmer_frame_at = time.monotonic()
-        except OSError as e:
-            log.error("video warmer: read error: %s", e)
-        finally:
-            stats["video_warmer_running"] = False
-            try:
-                proc.terminate()
-                proc.wait(timeout=3)
-            except Exception:
-                proc.kill()
-
-        if not shutdown_event.is_set():
-            log.info("video warmer: restarting in %.1fs", backoff)
-            shutdown_event.wait(backoff)
-            backoff = min(backoff * 2, 5.0)
-
+    stats["video_warmer_running"] = False
     log.info("video warmer: exiting")
 
 
