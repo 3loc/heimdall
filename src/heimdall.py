@@ -22,9 +22,13 @@ EnvironmentFile per instance:
                                          exclude list, preferring USB-Audio.
     HEIMDALL_AUDIO_AUTODETECT_EXCLUDE    comma-separated card names to skip
                                          when CARD_NAME=auto (default: "Neo")
-    HEIMDALL_AUDIO_DEVICE                literal ALSA device escape hatch,
-                                         e.g. "hw:0", "plughw:Neo,0".
+    HEIMDALL_AUDIO_DEVICE                literal device escape hatch,
+                                         e.g. "hw:0", "plughw:Neo,0" (ALSA)
+                                         or a PulseAudio source name.
                                          Bypasses card-name lookup entirely.
+    HEIMDALL_AUDIO_FORMAT                ffmpeg input format (default: "alsa").
+                                         Set to "pulse" for PipeWire/PulseAudio
+                                         sources (e.g. Bluetooth headsets).
     HEIMDALL_AUDIO_SOCKET                fan-out Unix socket path
                                          (default: /run/heimdall/$LABEL.sock)
     HEIMDALL_AUDIO_RATE                  sample rate Hz (default: 16000)
@@ -123,6 +127,13 @@ AUDIO_CHANNELS = int(os.environ.get("HEIMDALL_AUDIO_CHANNELS", "1"))
 # 6 inches from a lav mic is typically -20 to -10 dB, so 0.015 passes
 # speech comfortably and gates distant sounds / ambient noise.
 AUDIO_FILTER = os.environ.get("HEIMDALL_AUDIO_FILTER", "").strip()
+# ffmpeg input format for the audio capture device. "alsa" for hardware
+# ALSA cards (default), "pulse" for PipeWire/PulseAudio sources (e.g.
+# Bluetooth headsets that only appear as PipeWire nodes, not in
+# /proc/asound/cards). When set to "pulse", HEIMDALL_AUDIO_DEVICE must
+# name a PulseAudio source (pactl list sources short) and card-name
+# resolution is skipped entirely.
+AUDIO_FORMAT = os.environ.get("HEIMDALL_AUDIO_FORMAT", "alsa")
 VIDEO_ENABLED = os.environ.get("HEIMDALL_VIDEO_ENABLED", "0") == "1"
 VIDEO_DEVICE = os.environ.get("HEIMDALL_VIDEO_DEVICE", "/dev/video0")
 # Continuous background frame grabber. Keeps /dev/video0 open and a
@@ -298,16 +309,21 @@ def autodetect_capture_card(exclude: set[str]) -> tuple[int, str] | None:
 
 
 def resolve_audio_device() -> str | None:
-    """Compute the ALSA device string to pass to ffmpeg, or None if absent.
+    """Compute the audio device string to pass to ffmpeg, or None if absent.
 
     Priority:
       1. HEIMDALL_AUDIO_DEVICE — used verbatim (escape hatch).
       2. HEIMDALL_AUDIO_CARD_NAME == "auto" — auto-detect any plugged-in
          capture device, respecting HEIMDALL_AUDIO_AUTODETECT_EXCLUDE.
       3. HEIMDALL_AUDIO_CARD_NAME == "<name>" — look up that exact card.
+
+    When HEIMDALL_AUDIO_FORMAT == "pulse", only HEIMDALL_AUDIO_DEVICE is
+    checked (the PulseAudio source name). Card-name resolution is ALSA-only.
     """
     if AUDIO_DEVICE_OVERRIDE:
         return AUDIO_DEVICE_OVERRIDE
+    if AUDIO_FORMAT == "pulse":
+        return None  # no PulseAudio source name configured
     if AUDIO_CARD_NAME == "auto":
         result = autodetect_capture_card(AUDIO_AUTODETECT_EXCLUDE)
         if result is None:
@@ -331,7 +347,7 @@ def start_audio_ffmpeg(device: str) -> subprocess.Popen:
     cmd = [
         "ffmpeg",
         "-hide_banner", "-loglevel", "error", "-nostats",
-        "-f", "alsa", "-i", device,
+        "-f", AUDIO_FORMAT, "-i", device,
     ]
     if AUDIO_FILTER:
         cmd.extend(["-af", AUDIO_FILTER])
