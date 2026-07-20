@@ -703,6 +703,20 @@ class HeimdallHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log.debug("http: " + fmt, *args)
 
+    def send_error(self, code, message=None, explain=None):
+        """Coerce the reason phrase to ASCII before it reaches the status line.
+
+        http.server encodes the status line as latin-1. A non-latin-1
+        character in `message` (an em-dash, a smart quote) raises
+        UnicodeEncodeError *inside the error path itself*, so the socket is
+        torn down mid-response and the client sees "Empty reply from server"
+        rather than the intended 4xx/5xx. That turns a clean, debuggable
+        error into a mystery hang. Sanitise here so no future caller can
+        reintroduce it by typing a prettier dash."""
+        if message is not None:
+            message = message.encode("ascii", "replace").decode("ascii")
+        return super().send_error(code, message, explain)
+
     def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
         if self.path == "/healthz":
             return self._send(200, b"ok\n", "text/plain")
@@ -749,7 +763,7 @@ class HeimdallHandler(http.server.BaseHTTPRequestHandler):
             data = SNAPSHOT_PATH.read_bytes()
         except FileNotFoundError:
             return self.send_error(
-                404, "no snapshot taken yet — POST /snapshot.png to capture one"
+                404, "no snapshot taken yet - POST /snapshot.png to capture one"
             )
         except OSError as e:
             return self.send_error(500, f"snapshot read failed: {e}")
